@@ -233,11 +233,15 @@ impl Triangle {
             &swapchain_image_views,
         )?;
 
+        //ImageView  = "Картина" (800x600 пикселей)
+        //Framebuffer = "Рамка + инструкция как вешать"
+        //RenderPass = "Инструкция: залей чёрным → рисуй треугольник"
+
 //pipeline и pipeline_layout — графический конвейер:
         let (pipeline, pipeline_layout) =
             create_vulkan_pipeline(&device, render_pass, swapchain_extent)?;
 
-// Create and record command buffers (one per swapchain frame)
+//COMMAND_BUFFER → cmd_draw() ← Рисует В Framebuffer0 → Image0 → ЭКРАН!
         let command_buffers = create_and_record_command_buffers(
             &device,
             command_pool,
