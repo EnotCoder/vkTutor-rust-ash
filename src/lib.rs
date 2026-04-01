@@ -11,6 +11,13 @@ use std::{
 };
 use winit::{dpi::PhysicalSize, event_loop::ActiveEventLoop, window::Window};
 
+//данные о цвете
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct PushConstants {
+    pub color: [f32; 4],
+}
+
 pub fn create_window(
     event_loop: &ActiveEventLoop,
     app_name: &str,
@@ -461,18 +468,25 @@ pub fn create_vulkan_pipeline(
     render_pass: vk::RenderPass,
     extent: vk::Extent2D,
 ) -> Result<(vk::Pipeline, vk::PipelineLayout), Box<dyn Error>> {
-    let layout_info = vk::PipelineLayoutCreateInfo::default();
+    //добавляем подержку в шейдер
+    let push_range = vk::PushConstantRange {
+        stage_flags: vk::ShaderStageFlags::FRAGMENT,
+        offset: 0,
+        size: std::mem::size_of::<PushConstants>() as u32,
+    };
+    
+    let layout_info = vk::PipelineLayoutCreateInfo::default()
+        .push_constant_ranges(std::slice::from_ref(&push_range));
+    //Регистрируем
     let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
 
     let entry_point_name = CString::new("main")?;
 
-    let vertex_source =
-        read_shader_from_bytes(&include_bytes!("../assets/shaders/shader.vert.spv")[..])?;
+    let vertex_source = read_shader_from_bytes(&include_bytes!("../assets/shaders/shader.vert.spv")[..])?;
     let vertex_create_info = vk::ShaderModuleCreateInfo::default().code(&vertex_source);
     let vertex_module = unsafe { device.create_shader_module(&vertex_create_info, None)? };
 
-    let fragment_source =
-        read_shader_from_bytes(&include_bytes!("../assets/shaders/shader.frag.spv")[..])?;
+    let fragment_source = read_shader_from_bytes(&include_bytes!("../assets/shaders/shader.frag.spv")[..])?;
     let fragment_create_info = vk::ShaderModuleCreateInfo::default().code(&fragment_source);
     let fragment_module = unsafe { device.create_shader_module(&fragment_create_info, None)? };
 
@@ -556,8 +570,7 @@ pub fn create_vulkan_pipeline(
         .subpass(0)];
 
     let pipeline = unsafe {
-        device
-            .create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
             .map_err(|e| e.1)?[0]
     };
 
@@ -570,60 +583,42 @@ pub fn create_vulkan_pipeline(
 }
 
 pub fn create_and_record_command_buffers(
-    device: &Device,
-    pool: vk::CommandPool,
-    count: usize,
-    framebuffers: &[vk::Framebuffer],
-    render_pass: vk::RenderPass,
-    pipeline: vk::Pipeline,
-    extent: vk::Extent2D,
+    device: &Device, pool: vk::CommandPool, count: usize,
+    framebuffers: &[vk::Framebuffer], render_pass: vk::RenderPass,
+    pipeline: vk::Pipeline, extent: vk::Extent2D, pipeline_layout: vk::PipelineLayout,
 ) -> Result<Vec<vk::CommandBuffer>, Box<dyn Error>> {
-    let buffers = {
-        let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(count as _);
-
-        unsafe { device.allocate_command_buffers(&allocate_info)? }
+    let buffers = unsafe { 
+        device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool).level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(count as _))?
     };
 
-    for (index, buffer) in buffers.iter().enumerate() {
-        let buffer = *buffer;
+    for (index, &buffer) in buffers.iter().enumerate() {
+        unsafe { device.begin_command_buffer(buffer, &vk::CommandBufferBeginInfo::default())?; }
 
-        let command_buffer_begin_info = vk::CommandBufferBeginInfo::default();
-        unsafe { device.begin_command_buffer(buffer, &command_buffer_begin_info)? };
-
-        //структура которая отсылает framebufer в render_pass
         let render_pass_begin_info = vk::RenderPassBeginInfo::default()
             .render_pass(render_pass)
             .framebuffer(framebuffers[index])
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
-            })
+            .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
             .clear_values(&[vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 1.0], //цвет фона
-                },
+                color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] },
             }]);
 
-        unsafe {//начать рендер пасс
-            device.cmd_begin_render_pass(
-                buffer,
-                &render_pass_begin_info,
-                vk::SubpassContents::INLINE,
-            )
-        };
-
-        unsafe {//указываем Pipeline и buffer
-            device.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, pipeline) };
-
-        unsafe { device.cmd_draw(buffer, 6/*vert*/, 1/*intance*/, 0, 0) }; //рендерим наш квадрат
-
-        unsafe { device.cmd_end_render_pass(buffer) };//конец рендер пасс
-
-        unsafe { device.end_command_buffer(buffer)? };//конец команд буфера
+        unsafe {
+            device.cmd_begin_render_pass(buffer, &render_pass_begin_info, vk::SubpassContents::INLINE);
+            device.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            //первый кадр белый цвет
+            let default_color = PushConstants { color: [1.0, 1.0, 1.0, 1.0] };
+            let color_bytes = std::slice::from_raw_parts(
+                &default_color as *const _ as *const u8,
+                std::mem::size_of::<PushConstants>(),
+            );
+            device.cmd_push_constants(buffer, pipeline_layout, vk::ShaderStageFlags::FRAGMENT, 0, color_bytes);
+            
+            device.cmd_draw(buffer, 6, 1, 0, 0);
+            device.cmd_end_render_pass(buffer);
+        }
+        unsafe { device.end_command_buffer(buffer)?; }
     }
-
     Ok(buffers)
 }

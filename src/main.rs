@@ -28,6 +28,8 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use vk_triangle_rs::PushConstants;
+
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
 const APP_NAME: &str = "Triangle";
@@ -259,6 +261,7 @@ impl Triangle {
             render_pass,
             pipeline,
             swapchain_extent,
+            pipeline_layout,
         )?;
 
 //EVENTS
@@ -316,12 +319,9 @@ impl Triangle {
     }
 
     fn draw(&mut self) -> Result<bool, Box<dyn Error>> {
-        //получаем доступ к fence из структуры Triangle
         let fence = self.fence;
-        //Ждём завершение преведущего кадра
         unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX)? };
 
-        //Берём кадр из swapchain 01
         let next_image_result = unsafe {
             self.swapchain.acquire_next_image(
                 self.swapchain_khr,
@@ -331,60 +331,84 @@ impl Triangle {
             )
         };
 
-        // Ok((0, false))  → "Бери кадр #0, всё ок"
-        // Ok((1, true))   → "Бери кадр #1, но swapchain неоптимален" 
-        // Err(OUT_OF_DATE) → "Swapchain МЁРТВ! Пересоздай!"
-        // Err(ДРУГОЕ)     → "GPU сломался!"
         let image_index = match next_image_result {
             Ok((image_index, _)) => image_index,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                return Ok(true);
-            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Ok(true),
             Err(error) => panic!("Error while acquiring next image. Cause: {}", error),
         };
 
-        //Сбрасываем
-        unsafe { self.device.reset_fences(&[fence])? };
+        //передаём цвет
+        let color = PushConstants { color: [1.0, 1.0, 1.0, 1.0] };
+        let color_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &color as *const _ as *const u8,
+                std::mem::size_of::<PushConstants>(),
+            )
+        };
 
-        //Готовим команды для GPU
+        //делаем тоже что и в create_and_record_command_buffers
+        unsafe {
+            let cb = self.command_buffers[image_index as usize];
+            self.device.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default())?;
+
+            let render_pass_begin_info = vk::RenderPassBeginInfo::default()
+                .render_pass(self.render_pass)
+                .framebuffer(self.framebuffers[image_index as usize])
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width: WIDTH, height: HEIGHT },
+                })
+                .clear_values(&[vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.1, 0.1, 0.2, 1.0] },
+                }]);
+
+            self.device.cmd_begin_render_pass(cb, &render_pass_begin_info, vk::SubpassContents::INLINE);
+            self.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            
+            self.device.cmd_push_constants(
+                cb,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                color_bytes,
+            );
+            
+            self.device.cmd_draw(cb, 6, 1, 0, 0);
+            self.device.cmd_end_render_pass(cb);
+            self.device.end_command_buffer(cb)?;
+        }
+
+        // СБРАСЫВАЕМ FENCE
+        unsafe { self.device.reset_fences(&[fence])?; }
+
+        // 🔥 ВОССТАНАВЛИВАЕМ ПЕРЕМЕННЫЕ ДЛЯ SUBMIT
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let wait_semaphores = [self.image_available_semaphore];
         let signal_semaphores = [self.render_finished_semaphore];
-
         let command_buffers = [self.command_buffers[image_index as usize]];
-        //наполняем структуру submitInfo
+
         let submit_info = [vk::SubmitInfo::default()
             .wait_semaphores(&wait_semaphores)
             .wait_dst_stage_mask(&wait_stages)
             .command_buffers(&command_buffers)
             .signal_semaphores(&signal_semaphores)];
-        //Отправляем на GPU
-        unsafe {
-            self.device.queue_submit(self.graphics_queue, &submit_info, fence)?
-        };
 
-        let swapchains = [self.swapchain_khr]; //куда показывать
-        let images_indices = [image_index];//картинка которую мы только что взяли для рендеринга
-        //наполняем структуру presentInfo
-        let present_info = vk::PresentInfoKHR::default() //какой кадр
-        //указываем симафор для того чтобы отрисовать картинку если кадр готов
+        unsafe { self.device.queue_submit(self.graphics_queue, &submit_info, fence)? };
+
+        let swapchains = [self.swapchain_khr];
+        let images_indices = [image_index];
+        let present_info = vk::PresentInfoKHR::default()
             .wait_semaphores(&signal_semaphores)
             .swapchains(&swapchains)
-        //передаём кадр который нужно отобразить
             .image_indices(&images_indices);
 
         let present_result = unsafe {
-            self.swapchain
-                //отправляет картинку на экран 02
-                .queue_present(self.present_queue, &present_info)
+            self.swapchain.queue_present(self.present_queue, &present_info)
         };
+        
         match present_result {
-            Ok(is_suboptimal) if is_suboptimal => {
-                return Ok(true);
-            }
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                return Ok(true);
-            }
+            Ok(is_suboptimal) if is_suboptimal => return Ok(true),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Ok(true),
             Err(error) => panic!("Failed to present queue. Cause: {}", error),
             _ => {}
         }
